@@ -6,6 +6,7 @@ import logging
 import threading
 import json
 import os
+from scapy.utils import PcapWriter
 
 # Define tab spacing for formatting output
 TAB_1 = '\t - '
@@ -19,8 +20,12 @@ DATA_TAB_3 = '\t\t\t '
 DATA_TAB_4 = '\t\t\t\t '
 
 stop_event = threading.Event()
+capture_thread = None
+pcap_writer = None
 
 def main():
+    global capture_thread
+    global pcap_writer
     args = parse_arguments()
     setup_logging(args.verbose)
 
@@ -34,22 +39,33 @@ def main():
         logging.error(f"Error creating socket: {e}")
         return
 
+    if args.pcap:
+        pcap_writer = PcapWriter(args.output, append=True, sync=True)
+
     if args.dynamic:
         logging.info("Starting dynamic packet capture mode. Type 'start' to begin capturing and 'stop' to end.")
         while True:
             command = input("> ").strip().lower()
             if command == "start":
-                start_capture(connection, args)
+                if not capture_thread or not capture_thread.is_alive():
+                    start_capture(connection, args)
+                else:
+                    logging.info("Packet capture is already running.")
             elif command == "stop":
                 stop_capture()
             elif command == "exit":
-                if stop_event.is_set():
+                if capture_thread and capture_thread.is_alive():
                     stop_capture()
+                    capture_thread.join()
                 break
             else:
                 logging.info("Unknown command. Available commands: 'start', 'stop', 'exit'")
     else:
-        capture_packets(connection, args)
+        start_capture(connection, args)
+        capture_thread.join()
+
+    if pcap_writer:
+        pcap_writer.close()
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="A simple packet sniffer.")
@@ -88,22 +104,21 @@ def capture_packets(connection, args):
     logging.info(f"Captured {packet_count} packets.")
 
 def start_capture(connection, args):
-    if not stop_event.is_set():
+    global capture_thread
+    if stop_event.is_set():
         stop_event.clear()
-        capture_thread = threading.Thread(target=capture_packets, args=(connection, args))
-        capture_thread.start()
-        logging.info("Packet capture started.")
-    else:
-        logging.info("Packet capture is already running.")
+
+    capture_thread = threading.Thread(target=capture_packets, args=(connection, args))
+    capture_thread.start()
+    logging.info("Packet capture started.")
 
 def stop_capture():
-    if not stop_event.is_set():
-        logging.info("Packet capture is not running.")
-    else:
-        stop_event.set()
-        logging.info("Stopping packet capture...")
+    stop_event.set()
+    logging.info("Stopping packet capture...")
 
 def process_packet(raw_data, args):
+    global pcap_writer
+
     dest_mac, src_mac, eth_proto, data = ethernet_frame(raw_data)
     packet_data = {
         "Ethernet Frame": {
@@ -208,10 +223,6 @@ def process_packet(raw_data, args):
                 logging.info(f"{TAB_2}Data:")
                 logging.info(format_multi_line(DATA_TAB_3, data))
 
-        else:
-            logging.info(f"{TAB_1}Data:")
-            logging.info(format_multi_line(DATA_TAB_2, data))
-
     elif eth_proto == 1544 and (args.filter in ['all', 'arp']):  # ARP
         hardware_type, protocol_type, hardware_size, protocol_size, opcode, src_mac, src_ip, dest_mac, dest_ip = arp_packet(data)
         packet_data["ARP Packet"] = {
@@ -234,6 +245,9 @@ def process_packet(raw_data, args):
         if args.json:
             with open(args.output, 'a') as f:
                 f.write(json.dumps(packet_data, indent=4) + '\n')
+        elif args.pcap:
+            if pcap_writer:
+                pcap_writer.write(raw_data)
         else:
             with open(args.output, 'a') as f:
                 f.write(f"{raw_data}\n")
